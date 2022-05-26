@@ -1747,23 +1747,15 @@ func (db *DB) stream(ctx context.Context) error {
 
 // streamSnapshot reads the snapshot into the WAL and applies it to the main database.
 func (db *DB) streamSnapshot(ctx context.Context, hdr *StreamRecordHeader, r io.Reader) error {
-	// Truncate WAL file.
-	if _, err := db.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return fmt.Errorf("truncate: %w", err)
-	}
-
 	// Determine total page count.
 	pageN := int(hdr.Size / int64(db.pageSize))
 
-	ww := NewWALWriter(db.WALPath(), db.fileMode, db.pageSize)
-	if err := ww.Open(); err != nil {
-		return fmt.Errorf("open wal writer: %w", err)
+	// Open database file.
+	f, err := os.OpenFile(db.path, os.O_RDWR, 0666)
+	if err != nil {
+		return fmt.Errorf("open db file: %w", err)
 	}
-	defer func() { _ = ww.Close() }()
-
-	if err := ww.WriteHeader(); err != nil {
-		return fmt.Errorf("write wal header: %w", err)
-	}
+	defer f.Close()
 
 	// Iterate over pages
 	buf := make([]byte, db.pageSize)
@@ -1775,21 +1767,18 @@ func (db *DB) streamSnapshot(ctx context.Context, hdr *StreamRecordHeader, r io.
 			return fmt.Errorf("read snapshot page %d: %w", pgno, err)
 		}
 
-		// Issue a commit flag when the last page is reached.
-		var commit uint32
+		// Copy page to database file.
+		offset := int64(pgno-1) * int64(db.pageSize)
+		if _, err := f.WriteAt(buf, offset); err != nil {
+			return fmt.Errorf("copy to db: pgno=%d err=%w", pgno, err)
+		}
+
+		// Truncate database to final size.
 		if pgno == uint32(pageN) {
-			commit = uint32(pageN)
+			if err := f.Truncate(int64(pageN) * int64(db.pageSize)); err != nil {
+				return fmt.Errorf("truncate db: commit=%d err=%w", pageN, err)
+			}
 		}
-
-		// Write page into WAL frame.
-		if err := ww.WriteFrame(pgno, commit, buf); err != nil {
-			return fmt.Errorf("write wal frame: %w", err)
-		}
-	}
-
-	// Close WAL file writer.
-	if err := ww.Close(); err != nil {
-		return fmt.Errorf("close wal writer: %w", err)
 	}
 
 	// Invalidate WAL index.
@@ -1819,39 +1808,44 @@ func (db *DB) streamWALSegment(ctx context.Context, hdr *StreamRecordHeader, r i
 		}
 	}
 
-	ww := NewWALWriter(db.WALPath(), db.fileMode, db.pageSize)
-	if err := ww.Open(); err != nil {
-		return fmt.Errorf("open wal writer: %w", err)
+	// Open database file.
+	f, err := os.OpenFile(db.path, os.O_RDWR, 0666)
+	if err != nil {
+		return fmt.Errorf("open db file: %w", err)
 	}
-	defer func() { _ = ww.Close() }()
-
-	if err := ww.WriteHeader(); err != nil {
-		return fmt.Errorf("write wal header: %w", err)
-	}
+	defer f.Close()
 
 	// Iterate over incoming WAL pages.
 	buf := make([]byte, WALFrameHeaderSize+db.pageSize)
 	for i := 0; ; i++ {
 		// Read snapshot page into a buffer.
-		if _, err := io.ReadFull(zr, buf); err == io.EOF {
+		if n, err := io.ReadFull(zr, buf); err == io.EOF {
 			break
 		} else if err != nil {
-			return fmt.Errorf("read wal frame %d: %w", i, err)
+			return fmt.Errorf("read wal frame: i=%d n=%d err=%w", i, n, err)
 		}
 
 		// Read page number & commit field.
 		pgno := binary.BigEndian.Uint32(buf[0:])
 		commit := binary.BigEndian.Uint32(buf[4:])
 
-		// Write page into WAL frame.
-		if err := ww.WriteFrame(pgno, commit, buf[WALFrameHeaderSize:]); err != nil {
-			return fmt.Errorf("write wal frame: %w", err)
+		// Copy page to database file.
+		offset := int64(pgno-1) * int64(db.pageSize)
+		if _, err := f.WriteAt(buf[WALFrameHeaderSize:], offset); err != nil {
+			return fmt.Errorf("copy to db: pgno=%d err=%w", pgno, err)
+		}
+
+		// Truncate database, if commit specified.
+		if commit != 0 {
+			if err := f.Truncate(int64(commit) * int64(db.pageSize)); err != nil {
+				return fmt.Errorf("truncate db: commit=%d err=%w", commit, err)
+			}
 		}
 	}
 
-	// Close WAL file writer.
-	if err := ww.Close(); err != nil {
-		return fmt.Errorf("close wal writer: %w", err)
+	// Close database file writer.
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close db writer: %w", err)
 	}
 
 	// Invalidate WAL index.
@@ -2019,18 +2013,22 @@ func logPrefixPath(path string) string {
 // invalidateSHMFile clears the iVersion field of the -shm file in order that
 // the next transaction will rebuild it.
 func invalidateSHMFile(dbPath string) error {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return fmt.Errorf("reopen db: %w", err)
-	}
-	defer func() { _ = db.Close() }()
+	/*
+		db, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			return fmt.Errorf("reopen db: %w", err)
+		}
+		defer func() { _ = db.Close() }()
 
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
-		return fmt.Errorf("passive checkpoint: %w", err)
-	}
+		if _, err := db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+			return fmt.Errorf("passive checkpoint: %w", err)
+		}
+	*/
 
 	f, err := os.OpenFile(dbPath+"-shm", os.O_RDWR, 0666)
-	if err != nil {
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
 		return fmt.Errorf("open shm index: %w", err)
 	}
 	defer f.Close()
@@ -2052,11 +2050,13 @@ func invalidateSHMFile(dbPath string) error {
 		return fmt.Errorf("close shm index: %w", err)
 	}
 
-	// Truncate WAL file again.
-	var row [3]int
-	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return fmt.Errorf("truncate: %w", err)
-	}
+	/*
+		// Truncate WAL file again.
+		var row [3]int
+		if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&row[0], &row[1], &row[2]); err != nil {
+			return fmt.Errorf("truncate: %w", err)
+		}
+	*/
 
 	return nil
 }
